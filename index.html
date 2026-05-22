@@ -294,12 +294,11 @@ body::after{
 
 .board-wrap{ position:relative; overflow:hidden; }
 .board{
-  --tile-size: min(86px, calc((100% - 86px) / 4));
   display:grid;
-  grid-template-columns: repeat(4, var(--tile-size));
-  grid-template-rows: repeat(4, var(--tile-size));
+  grid-template-columns: repeat(4, 1fr);
   gap:var(--gap);
-  justify-content:center;
+  width:100%;
+  max-width:430px;
   padding:22px;
   background:var(--panel-2);
   border-radius:16px;
@@ -309,8 +308,7 @@ body::after{
     0 8px 28px rgba(0,0,0,.35);
 }
 .cell{
-  width:var(--tile-size);
-  height:var(--tile-size);
+  aspect-ratio:1;
   border-radius:var(--tile-radius);
   display:flex; align-items:center; justify-content:center;
   font-weight:900; font-size:28px;
