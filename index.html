@@ -292,13 +292,15 @@ body::after{
   --indicator-gap:10px;
 }
 
-.board-wrap{ position:relative; min-width:0; }
+.board-wrap{ position:relative; }
 .board-clip{ overflow:hidden; }
 .board{
+  --tile:86px;
   display:grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(4, var(--tile));
+  grid-template-rows: repeat(4, var(--tile));
   gap:var(--gap);
-  width:min(430px, 100%);
+  width:fit-content;
   padding:22px;
   background:var(--panel-2);
   border-radius:16px;
@@ -308,8 +310,8 @@ body::after{
     0 8px 28px rgba(0,0,0,.35);
 }
 .cell{
-  aspect-ratio:1;
-  min-width:0;
+  width:var(--tile);
+  height:var(--tile);
   border-radius:var(--tile-radius);
   display:flex; align-items:center; justify-content:center;
   font-weight:900; font-size:28px;
@@ -874,6 +876,15 @@ let indicatorsEl = null;
 let lastRowTaps = [0,0,0,0];
 let lastColTaps = [0,0,0,0];
 
+function updateTileSize(){
+  const clip = document.querySelector('.board-clip');
+  const board = document.getElementById('gridBoard');
+  if(!clip || !board) return;
+  const available = clip.clientWidth - 44; // 22px padding each side
+  const tile = Math.min(86, Math.floor((available - 42) / 4)); // 42 = 3 gaps × 14px
+  board.style.setProperty('--tile', tile + 'px');
+}
+
 function classFor(v){ return v===-1?'v--1':(v===0?'v-0':'v-1'); }
 function nextValue(value){ const CYCLE = [-1,1,0]; return CYCLE[(CYCLE.indexOf(value)+1)%3]; }
 
@@ -1028,7 +1039,7 @@ async function gridInit(root){
           <li>Editing the board clears the solution until you Solve again.</li>
           <li>Not every board has a 14+ solution. This tool only provides the perfect solution (highest score) for your board.</li>
           <li>Use this on a different device than the game. The board changes when minimizing the game.</li>
-          <li>This is fan made. Don't bug souptheduck about this helper lol. (1.1)</li>
+          <li>This is fan made. Don't bug souptheduck about this helper lol. (1.2)</li>
         </ul>
       </div>
     </section>
@@ -1059,6 +1070,7 @@ async function gridInit(root){
   const boardEl = document.getElementById('gridBoard');
   indicatorsEl = document.getElementById('gridIndicators');
 
+  updateTileSize();
   renderBoard(boardEl);
   showGridPlaceholder();
 
@@ -1087,7 +1099,10 @@ function gridDestroy(){
 
 function onResize(){
   clearTimeout(window.__grid_resize);
-  window.__grid_resize = setTimeout(()=> requestAnimationFrame(()=> updateIndicators(lastRowTaps,lastColTaps)), 120);
+  window.__grid_resize = setTimeout(()=> requestAnimationFrame(()=>{
+    updateTileSize();
+    updateIndicators(lastRowTaps,lastColTaps);
+  }), 120);
 }
 
 // === sanctum/solver ===
