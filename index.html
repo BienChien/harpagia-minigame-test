@@ -295,10 +295,9 @@ body::after{
 .board-wrap{ position:relative; overflow:hidden; }
 .board{
   display:grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap:var(--gap);
-  width:100%;
-  max-width:430px;
+  width:min(430px, 100%);
   padding:22px;
   background:var(--panel-2);
   border-radius:16px;
@@ -309,6 +308,7 @@ body::after{
 }
 .cell{
   aspect-ratio:1;
+  min-width:0;
   border-radius:var(--tile-radius);
   display:flex; align-items:center; justify-content:center;
   font-weight:900; font-size:28px;
