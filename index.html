@@ -287,7 +287,6 @@ body::after{
 }
 .input.small{ min-width:80px; width:120px; }
 :root{
-  --tile-size: min(86px, calc((100vw - 158px) / 4));
   --tile-radius:14px;
   --indicator-size:38px;
   --indicator-gap:10px;
@@ -295,6 +294,7 @@ body::after{
 
 .board-wrap{ position:relative; overflow:hidden; }
 .board{
+  --tile-size: min(86px, calc((100% - 86px) / 4));
   display:grid;
   grid-template-columns: repeat(4, var(--tile-size));
   grid-template-rows: repeat(4, var(--tile-size));
