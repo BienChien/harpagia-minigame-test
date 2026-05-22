@@ -293,6 +293,7 @@ body::after{
 }
 
 .board-wrap{ position:relative; min-width:0; }
+.board-clip{ overflow:hidden; }
 .board{
   display:grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1033,7 +1034,9 @@ async function gridInit(root){
     </section>
 
     <section class="card board-wrap" id="gridBoardCard">
-      <div class="board" id="gridBoard"></div>
+      <div class="board-clip">
+        <div class="board" id="gridBoard"></div>
+      </div>
       <div class="indicators" id="gridIndicators"></div>
       <div class="hint">Tap tiles to set the current board. Then press Solve.</div>
     </section>
