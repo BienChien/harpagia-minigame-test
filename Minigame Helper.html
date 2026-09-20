@@ -293,7 +293,7 @@ body::after{
 }
 
 .board-wrap{ position:relative; }
-.board-clip{ overflow:hidden; }
+.board-clip{ overflow:hidden; display:flex; justify-content:center; }
 .board{
   --tile:86px;
   display:grid;
@@ -453,6 +453,22 @@ body::after{
   align-items:start;
 }
 @media (max-width: 860px){ .layout-zen{ grid-template-columns:1fr; } }
+
+.layout-grid{
+  display:grid;
+  grid-template-columns: minmax(360px,1fr) minmax(360px,1fr);
+  gap:16px;
+  align-items:start;
+}
+.layout-grid > div:first-child{
+  position:sticky;
+  top:16px;
+  align-self:start;
+}
+@media (max-width: 860px){
+  .layout-grid{ grid-template-columns:1fr; }
+  .layout-grid > div:first-child{ position:static; }
+}
 
 .layout-zen > .card:first-child{
   position: sticky;
@@ -1044,27 +1060,31 @@ async function gridInit(root){
       </div>
     </section>
 
-    <section class="card board-wrap" id="gridBoardCard">
-      <div class="board-clip">
-        <div class="board" id="gridBoard"></div>
-      </div>
-      <div class="indicators" id="gridIndicators"></div>
-      <div class="hint">Tap tiles to set the current board. Then press Solve.</div>
-    </section>
+    <div class="layout-grid">
+      <div>
+        <section class="card board-wrap" id="gridBoardCard">
+          <div class="board-clip">
+            <div class="board" id="gridBoard"></div>
+          </div>
+          <div class="indicators" id="gridIndicators"></div>
+          <div class="hint">Tap tiles to set the current board. Then press Solve.</div>
+        </section>
 
-    <section class="card">
-      <div style="display:flex; gap:10px; justify-content:center; flex-wrap:wrap;">
-        <button class="btn btn-primary" id="gridSolveBtn">Solve</button>
-        <button class="btn btn-ghost" id="gridResetBtn">Reset</button>
+        <section class="card">
+          <div style="display:flex; gap:10px; justify-content:center; flex-wrap:wrap;">
+            <button class="btn btn-primary" id="gridSolveBtn">Solve</button>
+            <button class="btn btn-ghost" id="gridResetBtn">Reset</button>
+          </div>
+        </section>
       </div>
-    </section>
 
-    <section class="card results-grid">
-      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
-        <div class="panel-title">Optimal Solution</div>
-      </div>
-      <div id="gridResultsShell"></div>
-    </section>
+      <section class="card results-grid">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
+          <div class="panel-title">Optimal Solution</div>
+        </div>
+        <div id="gridResultsShell"></div>
+      </section>
+    </div>
   `;
 
   const boardEl = document.getElementById('gridBoard');
@@ -1850,6 +1870,14 @@ function initEngine(){
   // Helpers
   function hex6(v){ return (v>>>0).toString(16).padStart(6,'0'); }
   function toCssHex(v){ return `#${hex6(v)}`; }
+  // Samples come from VideoFrame.copyTo(..., 'RGBX') read back through a Uint32Array,
+  // so on a little-endian host a pixel is 0x00BBGGRR. Matching runs in that space and
+  // the reference keys are stored the same way, but anything painted on screen has to
+  // be flipped back to RGB or the swatch never matches the tile it sits on.
+  function bgrToCssHex(v){
+    const r=v&255, g=(v>>8)&255, b=(v>>16)&255;
+    return `#${hex6((r<<16)|(g<<8)|b)}`;
+  }
   function rgbDistSq(a,b){
     const ar=(a>>16)&255, ag=(a>>8)&255, ab=a&255;
     const br=(b>>16)&255, bg=(b>>8)&255, bb=b&255;
@@ -1881,10 +1909,22 @@ function initEngine(){
     revealEndSilenceMs: 500,
     inputTimeoutMs: 0,
     rearmDelayMs: 120,
+    // Cap on the quiet-frame wait below. Zen leaves roughly a second between the last correct
+    // tap and the next reveal, so staying well under that keeps even the degenerate case
+    // (tolerances mis-tuned, quiet frame never seen) armed before the first flash lands.
+    rearmMaxWaitMs: 700,
     modal: {
       dropMask: 0xfcfcfc,
       // Fixed reference sets (not exposed in UI)
-      tealKeys:  [0x84a000, 0x5CAC58, 0x4E9E8C],
+      // 0x85a016 is the reveal colour #16a085 byte-reversed into sample space. The older
+      // hand-sampled 0x84a000 was ~22 low on one channel, which cost enough margin to
+      // drop flashes on some capture pipelines.
+      // 0x5CAC58 and 0x4E9E8C were removed from this list: measured against the two
+      // colours the board actually uses, both sit closer to correct-tap #27ae60 than to
+      // reveal #16a085 (49 vs 79, and 104 vs 130). On a colour-shifted capture a tap
+      // therefore scored as a reveal, armed the next round, and leaked the tapped tile
+      // in as that round's first step.
+      tealKeys:  [0x85a016, 0x84a000],
       greenKeys: [0x5cac24, 0x52C058, 0x48A04E],
       sampleGrid: 10
     },
@@ -2023,12 +2063,15 @@ function initEngine(){
 
       diag.tiles[i] = { masked, count, total, dTeal: scoreTeal, dGreen: scoreGreen };
 
-      if (scoreTeal <= (config.match.tolerance.teal ?? 48)) {
+      // Reveal (#16a085) and correct-tap (#27ae60) sit only ~43 apart in sample space,
+      // which is inside the default teal tolerance of 48. Tolerance alone therefore
+      // cannot separate them; a tile only counts as teal if teal is its better fit.
+      if (scoreTeal <= (config.match.tolerance.teal ?? 48) && scoreTeal < scoreGreen) {
         if (scoreTeal < bestTealScore || (scoreTeal === bestTealScore && count > bestTealCount)) {
           bestTealScore=scoreTeal; bestTealCount=count; diag.bestTealIdx=i;
         }
       }
-      if (scoreGreen <= (config.match.tolerance.green ?? 36)) {
+      if (scoreGreen <= (config.match.tolerance.green ?? 36) && scoreGreen < scoreTeal) {
         if (scoreGreen < bestGreenScore || (scoreGreen === bestGreenScore && count > bestGreenCount)) {
           bestGreenScore=scoreGreen; bestGreenCount=count; diag.bestGreenIdx=i;
         }
@@ -2341,7 +2384,7 @@ function initEngine(){
           const dt = diag.tiles[i]; if (!dt) continue;
           const rr = Math.floor(i/cols), cc = i%cols;
           ctxOv.save();
-          ctxOv.fillStyle = toCssHex(dt.masked);
+          ctxOv.fillStyle = bgrToCssHex(dt.masked);
           ctxOv.strokeStyle = 'rgba(0,0,0,0.6)';
           ctxOv.lineWidth = 1;
           ctxOv.fillRect(cc*stepX + stepX*0.5 - sw/2, boardYCanvas + rr*stepY + stepY*0.5 - sw/2, sw, sw);
@@ -2372,7 +2415,7 @@ function initEngine(){
         const cy = (boardRect.y*sy) + r*stepY + stepY*0.5;
         const dt = diag.tiles[i]; if (!dt) continue;
         ctxOv.save();
-        ctxOv.fillStyle = toCssHex(dt.masked);
+        ctxOv.fillStyle = bgrToCssHex(dt.masked);
         ctxOv.strokeStyle = 'rgba(0,0,0,0.6)';
         ctxOv.lineWidth = 1;
         ctxOv.fillRect(cx - sw/2, cy - sw/2, sw, sw);
@@ -2485,9 +2528,15 @@ function initEngine(){
         break;
       }
 
-      case 'rearming':
-        if (tsNow - rearmTs >= config.rearmDelayMs) phase='armed';
+      case 'rearming': {
+        // A tap highlight routinely outlasts rearmDelayMs, and arming while one is still
+        // lit captures the tile just tapped as the next round's first reveal. Wait for a
+        // frame with nothing lit, but cap the wait so a mis-tuned tolerance can't stall.
+        const waited = tsNow - rearmTs;
+        const quiet = (bestTealIdx < 0 && bestGreenIdx < 0);
+        if (waited >= config.rearmDelayMs && (quiet || waited >= config.rearmMaxWaitMs)) phase='armed';
         break;
+      }
     }
 
     updateStatus();
@@ -2774,6 +2823,7 @@ async function zenInit(root) {
           <li>Check the console for errors.</li>
           <li>Report issues by messaging adude1537 on Discord. Please share a screenshot if possible, and be ready tell me your phone, pc, how you are sharing the screen.</li>
           <li>This is fan made. Don't bug souptheduck about this helper lol. Huge thanks to <strong>phoenixillusion!</strong></li>
+          <li style="margin-top:12px; font-size:16px; font-weight:800; line-height:1.5; color:#EAF2F8;">If you're using this tool and its not working, specifically for IOS -&gt; Windows, please try this tool instead, <a href="https://harpagia-app.vercel.app/" target="_blank" rel="noopener noreferrer" style="color:#1585A8; text-decoration:underline;">https://harpagia-app.vercel.app/</a></li>
         </ul>
       </div>
     </section>
