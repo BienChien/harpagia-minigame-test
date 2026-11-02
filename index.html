@@ -478,6 +478,8 @@ body::after{
 }
 
 .controls-zen{ display:grid; gap:12px; }
+/* School screen record: stacked on narrow screens, the sticky controls card would sit on top of the preview */
+@media (max-width: 860px){ .layout-srec > .card:first-child{ position:static; } }
 .row-zen{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
 
 .select-zen{
@@ -856,8 +858,14 @@ function columnSumAfterTaps(g, colIdx, taps){
   return g.reduce((sum,row)=> sum + cycleValue(row[colIdx], taps), 0);
 }
 
+// Exhaustive over all 81 row-tap combos; each column is then independent, so its best
+// tap count is picked per column. Ties are broken on total taps (fewest wins).
+// Taps commute and only count mod 3, so every final board is reachable by three plans
+// (add t to every row, subtract t from every column). The old version kept whichever
+// max-score plan it met first, which was not the cheapest one on ~1/3 of boards
+// (3, 6 or 9 extra taps). Score was never affected, only tap count.
 function optimizeTaps(grid){
-  let bestSum = -Infinity;
+  let bestSum = -Infinity, bestTaps = Infinity;
   let bestRowTaps = null, bestColTaps = null;
   for(let r0=0;r0<3;r0++){
     for(let r1=0;r1<3;r1++){
@@ -870,18 +878,19 @@ function optimizeTaps(grid){
             let bestCol=-Infinity, bestK=0;
             for(let k=0;k<3;k++){
               const s = columnSumAfterTaps(afterRows, j, k);
-              if(s>bestCol){ bestCol=s; bestK=k; }
+              if(s>bestCol){ bestCol=s; bestK=k; } // strict: equal sums keep the smaller k
             }
             colTaps.push(bestK); total+=bestCol;
           }
-          if(total > bestSum){
-            bestSum=total; bestRowTaps=rowTaps; bestColTaps=colTaps;
+          const taps = r0+r1+r2+r3 + colTaps[0]+colTaps[1]+colTaps[2]+colTaps[3];
+          if(total > bestSum || (total === bestSum && taps < bestTaps)){
+            bestSum=total; bestTaps=taps; bestRowTaps=rowTaps; bestColTaps=colTaps;
           }
         }
       }
     }
   }
-  return { bestSum, bestRowTaps, bestColTaps };
+  return { bestSum, bestRowTaps, bestColTaps, bestTaps };
 }
 
 // === grid/view ===
@@ -1051,6 +1060,7 @@ async function gridInit(root){
         <ul>
           <li>Click tiles to cycle values: -1 → +1 → 0 → -1.</li>
           <li>Press Solve to find row and column taps that maximize the total score.</li>
+          <li>When several plans reach the top score, the one with the fewest taps is shown.</li>
           <li>Indicators show how many times to tap each row or column.</li>
           <li>Editing the board clears the solution until you Solve again.</li>
           <li>Not every board has a 14+ solution. This tool only provides the perfect solution (highest score) for your board.</li>
@@ -1089,6 +1099,8 @@ async function gridInit(root){
 
   const boardEl = document.getElementById('gridBoard');
   indicatorsEl = document.getElementById('gridIndicators');
+  // Fresh board, so no tap badges either (these survive a remount otherwise).
+  lastRowTaps=[0,0,0,0]; lastColTaps=[0,0,0,0];
 
   updateTileSize();
   renderBoard(boardEl);
@@ -2953,6 +2965,771 @@ function zenDestroy() {}
 // Default export for router compatibility
 
 
+// === school-rec/read ===
+
+// Tile colours as the School board draws them. Measured from a phone capture; the three
+// sit 150+ apart in RGB, so per-pixel nearest-colour voting separates them comfortably
+// even on a compressed or colour-shifted stream.
+const SCHOOL_REFS = [
+  { value:-1, rgb:[0xe7,0x4c,0x3c] }, // red    #e74c3c
+  { value: 0, rgb:[0xff,0xd7,0x00] }, // yellow #ffd700
+  { value: 1, rgb:[0x4c,0xaf,0x50] }, // green  #4caf50
+];
+// Colours that are on the board but are not tile colour: panel background, tile text,
+// the white tap dots. In RGB mode a pixel nearest one of these abstains, which keeps the
+// gaps and digits out of the vote without a tight distance cutoff, so a colour-shifted
+// stream still reads (a yellow tile drifting toward olive is still nearer yellow than
+// anything else on the board).
+const SCHOOL_NON_TILE = [[0x34,0x49,0x5e],[0,0,0],[255,255,255]];
+const SCHOOL_REC_DEFAULTS = {
+  matchMode: 'rgb',   // 'rgb' | 'hue'
+  tolRgb: 150,        // sanity cap only: max RGB distance for a pixel to vote
+  tolHue: 25,         // max hue distance (deg) in hue mode; refs are ~6 / 51 / 122 deg
+  minVoteFrac: 0.35,  // share of a tile's samples the winning colour needs
+  stableFrames: 3,    // identical reads in a row before a board is accepted
+  sampleGrid: 9,      // NxN samples per tile
+  diagnostics: false,
+};
+
+function srRgbToHsv(r,g,b){
+  const max=Math.max(r,g,b), min=Math.min(r,g,b), d=max-min;
+  let h=0;
+  if (d){
+    if (max===r) h=((g-b)/d)%6; else if (max===g) h=(b-r)/d+2; else h=(r-g)/d+4;
+    h*=60; if (h<0) h+=360;
+  }
+  return { h, s: max ? d/max : 0, v: max/255 };
+}
+const SCHOOL_REF_HUES = SCHOOL_REFS.map(rf => srRgbToHsv(...rf.rgb).h);
+
+// Reads the 4x4 board from a pixel buffer that holds exactly the board box.
+// px: Uint32Array view of RGBA bytes (little-endian, so a pixel is 0xAABBGGRR).
+// Each tile samples an NxN grid over its central 56% and every sample votes for its
+// nearest reference colour (or abstains if too far from all of them). Dark tile text and
+// the gaps between tiles abstain, so they cannot outvote the tile colour.
+function schoolReadBoard(px, w, h, cfg){
+  const N = Math.max(3, cfg.sampleGrid|0);
+  const tolRgbSq = cfg.tolRgb * cfg.tolRgb;
+  const stepX = w/4, stepY = h/4;
+  const values = [], tiles = [];
+  for (let r=0;r<4;r++){
+    const row=[];
+    for (let c=0;c<4;c++){
+      const cx = (c+0.5)*stepX, cy = (r+0.5)*stepY;
+      const hx = stepX*0.28, hy = stepY*0.28;
+      const votes=[0,0,0]; const sum=[[0,0,0],[0,0,0],[0,0,0]];
+      for (let yi=0; yi<N; yi++){
+        const y = Math.min(h-1, Math.max(0, Math.round(cy - hy + (2*hy*yi)/(N-1))));
+        for (let xi=0; xi<N; xi++){
+          const x = Math.min(w-1, Math.max(0, Math.round(cx - hx + (2*hx*xi)/(N-1))));
+          const v = px[y*w + x];
+          const R=v&255, G=(v>>>8)&255, B=(v>>>16)&255;
+          let best=-1, bestD=Infinity;
+          if (cfg.matchMode === 'hue'){
+            const hsv = srRgbToHsv(R,G,B);
+            if (hsv.s < 0.35 || hsv.v < 0.35) continue;
+            for (let k=0;k<3;k++){
+              let d=Math.abs(hsv.h-SCHOOL_REF_HUES[k]); d=Math.min(d,360-d);
+              if (d<bestD){ bestD=d; best=k; }
+            }
+            if (bestD > cfg.tolHue) continue;
+          } else {
+            for (let k=0;k<3;k++){
+              const rf=SCHOOL_REFS[k].rgb;
+              const dr=R-rf[0], dg=G-rf[1], db=B-rf[2];
+              const d=dr*dr+dg*dg+db*db;
+              if (d<bestD){ bestD=d; best=k; }
+            }
+            if (bestD > tolRgbSq) continue;
+            let nonTile=false;
+            for (const rf of SCHOOL_NON_TILE){
+              const dr=R-rf[0], dg=G-rf[1], db=B-rf[2];
+              if (dr*dr+dg*dg+db*db < bestD){ nonTile=true; break; }
+            }
+            if (nonTile) continue;
+          }
+          votes[best]++; sum[best][0]+=R; sum[best][1]+=G; sum[best][2]+=B;
+        }
+      }
+      const total=N*N;
+      let win=0; for (let k=1;k<3;k++) if (votes[k]>votes[win]) win=k;
+      const second = Math.max(...votes.filter((_,k)=>k!==win));
+      const ok = votes[win] >= cfg.minVoteFrac*total && votes[win] > second;
+      const value = ok ? SCHOOL_REFS[win].value : null;
+      const n = Math.max(1, votes[win]);
+      tiles.push({ value, votes:[...votes], total,
+        avg:[sum[win][0]/n|0, sum[win][1]/n|0, sum[win][2]/n|0] });
+      row.push(value);
+    }
+    values.push(row);
+  }
+  return { values, tiles };
+}
+
+function schoolBoardScore(g){ return g.reduce((s,row)=> s + row.reduce((a,b)=>a+b,0), 0); }
+
+// === school-rec/engine ===
+
+function initSchoolRecEngine(){
+  const $ = id => document.getElementById(id);
+  const video = $('srVideo'), overlay = $('srOverlay'), previewWrap = $('srPreviewWrap');
+  const guideHeader = $('srGuideHeader');
+  const ctxOv = overlay.getContext('2d', { alpha:true });
+
+  const btnCapture=$('srBtnCapture'), btnStopCapture=$('srBtnStopCapture');
+  const btnSetBoard=$('srBtnSetBoard'), btnDoneEdit=$('srBtnDoneEdit'), btnClearBoard=$('srBtnClearBoard');
+  const btnShrinkBoard=$('srBtnShrinkBoard'), btnGrowBoard=$('srBtnGrowBoard'), quickResizeGroup=$('srQuickResizeGroup');
+  const btnStart=$('srBtnStart'), btnStop=$('srBtnStop');
+  const selMatchMode=$('srSelMatchMode'), inpTol=$('srInpTol'), inpVote=$('srInpVote'), inpStable=$('srInpStable');
+  const chkDiagnostics=$('srChkDiagnostics'), btnRestoreDefaults=$('srBtnRestoreDefaults');
+  const elFPS=$('srFps'), elRead=$('srRead'), elScore=$('srScore');
+  const resultsShell=$('srResultsShell');
+
+  overlay.style.touchAction='none';
+  overlay.setAttribute('tabindex','0');
+
+  const config = JSON.parse(JSON.stringify(SCHOOL_REC_DEFAULTS));
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+
+  function tolField(){ return config.matchMode==='hue' ? 'tolHue' : 'tolRgb'; }
+  function syncAdvancedUI(){
+    selMatchMode.value=config.matchMode;
+    inpTol.value=String(config[tolField()]);
+    inpVote.value=String(config.minVoteFrac);
+    inpStable.value=String(config.stableFrames);
+    chkDiagnostics.checked=!!config.diagnostics;
+  }
+  selMatchMode.addEventListener('change', ()=>{ config.matchMode=selMatchMode.value; syncAdvancedUI(); invalidateRead(); });
+  inpTol.addEventListener('change', ()=>{ const v=+inpTol.value; if (Number.isFinite(v)) config[tolField()]=clamp(v,1,config.matchMode==='hue'?90:255); invalidateRead(); });
+  inpVote.addEventListener('change', ()=>{ const v=+inpVote.value; if (Number.isFinite(v)) config.minVoteFrac=clamp(v,0.05,1); invalidateRead(); });
+  inpStable.addEventListener('change', ()=>{ const v=+inpStable.value; if (Number.isFinite(v)) config.stableFrames=clamp(Math.round(v),1,30); });
+  chkDiagnostics.addEventListener('change', ()=>{ config.diagnostics=!!chkDiagnostics.checked; });
+  btnRestoreDefaults.addEventListener('click', (e)=>{ e.preventDefault(); Object.assign(config, JSON.parse(JSON.stringify(SCHOOL_REC_DEFAULTS))); syncAdvancedUI(); invalidateRead(); });
+
+  // State
+  let stream=null, running=false, detectionActive=false, hasBoard=false;
+  let boardRect=null;              // video-space
+  let lastRead=null;               // latest raw read (for diagnostics)
+  let candKey=null, candCount=0;   // stability tracking
+  let board=null, boardKey=null;   // accepted board
+  let plan=null;                   // optimizeTaps result for the accepted board
+  let lastProcTs=0;
+  const PROC_INTERVAL_MS=40;       // ~25 reads/s is plenty for a board that changes on taps
+  const editor={ mode:'idle', rect:null, activeHandle:null, start:{x:0,y:0}, rectStart:null, handleSize:12 };
+  const pointerState={ active:false, id:-1 };
+
+  // Pixel reader: draws the board box into a small canvas and reads it back.
+  // Canvas readback is synchronous and works in every browser that can capture a screen.
+  const readCanvas=document.createElement('canvas');
+  const readCtx=readCanvas.getContext('2d', { willReadFrequently:true });
+  function readBoardPixels(){
+    const maxSide=320;
+    const s=Math.min(1, maxSide/Math.max(boardRect.w, boardRect.h));
+    const w=Math.max(8, Math.round(boardRect.w*s)), h=Math.max(8, Math.round(boardRect.h*s));
+    if (readCanvas.width!==w) readCanvas.width=w;
+    if (readCanvas.height!==h) readCanvas.height=h;
+    readCtx.drawImage(video, boardRect.x, boardRect.y, boardRect.w, boardRect.h, 0, 0, w, h);
+    const data=readCtx.getImageData(0,0,w,h).data;
+    return { px:new Uint32Array(data.buffer, data.byteOffset, w*h), w, h };
+  }
+
+  function invalidateRead(){ candKey=null; candCount=0; }
+
+  function processFrame(tsNow){
+    if (!hasBoard || !video.videoWidth) return;
+    if (tsNow - lastProcTs < PROC_INTERVAL_MS) return;
+    lastProcTs = tsNow;
+    let frame;
+    try { frame=readBoardPixels(); } catch(e){ elRead.textContent='error'; return; }
+    lastRead = schoolReadBoard(frame.px, frame.w, frame.h, config);
+    const unknown = lastRead.tiles.filter(t=>t.value===null).length;
+    elRead.textContent = unknown ? `${unknown} unclear` : 'OK';
+    if (!detectionActive) return;
+    if (unknown){ invalidateRead(); return; }
+    const key = lastRead.values.flat().join(',');
+    if (key===candKey) candCount++; else { candKey=key; candCount=1; }
+    if (candCount >= config.stableFrames && key !== boardKey){
+      board = lastRead.values.map(r=>[...r]);
+      boardKey = key;
+      plan = optimizeTaps(board);
+      renderResults();
+    }
+  }
+
+  function renderResults(){
+    if (!board || !plan){
+      resultsShell.innerHTML = `<div class="placeholder" style="height:120px;">${detectionActive ? 'Waiting for a clear read of the board…' : 'Start detection to read the board.'}</div>`;
+      elScore.textContent='-';
+      return;
+    }
+    const now = schoolBoardScore(board);
+    elScore.textContent = `${now} / ${plan.bestSum}`;
+    const cellsHtml = board.flat().map(v=>{
+      const cls = v===-1?'v--1':(v===0?'v-0':'v-1');
+      return `<div class="${cls}" style="border-radius:8px; aspect-ratio:1; display:flex; align-items:center; justify-content:center; font-weight:900; font-size:13px;">${v===1?'+1':v}</div>`;
+    }).join('');
+    const done = plan.bestTaps===0;
+    resultsShell.innerHTML = `
+      <div class="summary-row">
+        <div>
+          <div class="score">${plan.bestSum}</div>
+          <div style="font-size:12px; color:#b9c9d8; margin-top:2px;">Maximum Score (now ${now})</div>
+        </div>
+        <div class="badge">${done ? 'Solved' : plan.bestTaps + ' taps left'}</div>
+      </div>
+      <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:6px; max-width:220px; margin:12px 0;">${cellsHtml}</div>
+      <div class="tap-groups">
+        <div class="group"><h3>Row Taps</h3><div id="srRows"></div></div>
+        <div class="group"><h3>Column Taps</h3><div id="srCols"></div></div>
+      </div>
+      <div class="group">
+        <h3>Step-by-Step Sequence</h3>
+        <div class="sequence" id="srSeq"></div>
+      </div>`;
+    const rowsEl=$('srRows'), colsEl=$('srCols'), seqEl=$('srSeq');
+    let anyRow=false, anyCol=false; const seq=[];
+    plan.bestRowTaps.forEach((t,i)=>{ if(t>0){ anyRow=true; rowsEl.appendChild(rowLine(`Row ${i+1}`, t)); for(let k=0;k<t;k++) seq.push(`row ${i+1}`); } });
+    plan.bestColTaps.forEach((t,j)=>{ if(t>0){ anyCol=true; colsEl.appendChild(rowLine(`Column ${j+1}`, t)); for(let k=0;k<t;k++) seq.push(`column ${j+1}`); } });
+    if(!anyRow) rowsEl.appendChild(rowLine('No row taps needed','0'));
+    if(!anyCol) colsEl.appendChild(rowLine('No column taps needed','0'));
+    if (!seq.length){
+      const no=document.createElement('div'); no.style.color='#9eb6c8'; no.style.fontStyle='italic';
+      no.textContent = 'Board is at its best score. Press Train for a new board.'; seqEl.appendChild(no);
+    } else seq.forEach((s,idx)=> seqEl.appendChild(stepLine(idx+1, s)));
+  }
+
+  // ---- overlay sizing / crop (same idea as Zen: once the board is set, show only around it)
+  function cropRect(){
+    // Board plus room on the left and top for the in-game row/column dots.
+    const step=boardRect.w/4;
+    const vW=video.videoWidth, vH=video.videoHeight;
+    const x0=Math.max(0, boardRect.x - step*1.5), y0=Math.max(0, boardRect.y - step*1.5);
+    const x1=Math.min(vW, boardRect.x + boardRect.w + step*0.3), y1=Math.min(vH, boardRect.y + boardRect.h + step*0.3);
+    return { x:x0, y:y0, w:Math.max(1,x1-x0), h:Math.max(1,y1-y0) };
+  }
+  function isCropMode(){ return hasBoard && boardRect && video.videoWidth && editor.mode==='idle'; }
+  function updateOverlayBox(){
+    if (isCropMode()){
+      video.style.position='absolute'; video.style.opacity='0'; video.style.width='1px'; video.style.height='1px';
+      overlay.style.position='relative'; overlay.style.left=''; overlay.style.top='';
+      const p=previewWrap.getBoundingClientRect();
+      const cr=cropRect();
+      const destW=Math.max(1, Math.round(Math.min(p.width, 560)));
+      const destH=Math.max(1, Math.round(cr.h*destW/cr.w));
+      overlay.style.width=destW+'px'; overlay.style.height=destH+'px';
+      if (overlay.width!==destW) overlay.width=destW;
+      if (overlay.height!==destH) overlay.height=destH;
+      return;
+    }
+    video.style.position=''; video.style.opacity=''; video.style.width=''; video.style.height='';
+    overlay.style.position='absolute';
+    const v=video.getBoundingClientRect(), p=previewWrap.getBoundingClientRect();
+    const has=v.width>0&&v.height>0;
+    const left=has?v.left:p.left, top=has?v.top:p.top, width=has?v.width:p.width, height=has?v.height:p.height;
+    overlay.style.left=(left-p.left)+'px'; overlay.style.top=(top-p.top)+'px';
+    overlay.style.width=width+'px'; overlay.style.height=height+'px';
+    const w=Math.max(1,Math.round(width)), h=Math.max(1,Math.round(height));
+    if (overlay.width!==w) overlay.width=w;
+    if (overlay.height!==h) overlay.height=h;
+  }
+  function setOverlayPointer(on){
+    overlay.classList.toggle('pe-auto', on); overlay.classList.toggle('pe-none', !on);
+    overlay.style.pointerEvents = on?'auto':'none'; overlay.style.cursor = on?'crosshair':'default';
+  }
+
+  // ---- drawing
+  function drawGridAtRect(x,y,w,h){
+    ctxOv.save();
+    ctxOv.setLineDash([6,4]); ctxOv.lineWidth=2; ctxOv.strokeStyle='rgba(88,176,255,0.95)';
+    ctxOv.strokeRect(x,y,w,h);
+    ctxOv.setLineDash([2,3]); ctxOv.lineWidth=1.25; ctxOv.strokeStyle='rgba(100,210,220,0.5)';
+    for (let i=1;i<4;i++){
+      ctxOv.beginPath(); ctxOv.moveTo(x+i*w/4, y); ctxOv.lineTo(x+i*w/4, y+h); ctxOv.stroke();
+      ctxOv.beginPath(); ctxOv.moveTo(x, y+i*h/4); ctxOv.lineTo(x+w, y+i*h/4); ctxOv.stroke();
+    }
+    ctxOv.restore();
+  }
+  function drawBadge(cx, cy, r, n, pulse){
+    ctxOv.save();
+    ctxOv.beginPath(); ctxOv.arc(cx, cy, r*(1+0.08*pulse), 0, Math.PI*2);
+    ctxOv.fillStyle = n===2 ? 'rgba(255,0,255,0.92)' : 'rgba(34,197,94,0.95)';
+    ctxOv.shadowColor='rgba(0,0,0,0.45)'; ctxOv.shadowBlur=8;
+    ctxOv.fill();
+    ctxOv.shadowBlur=0; ctxOv.lineWidth=2; ctxOv.strokeStyle='rgba(255,255,255,0.9)'; ctxOv.stroke();
+    ctxOv.fillStyle='#fff'; ctxOv.font=`900 ${Math.round(r*1.15)}px system-ui, sans-serif`;
+    ctxOv.textAlign='center'; ctxOv.textBaseline='middle';
+    ctxOv.fillText('×'+n, cx, cy+1);
+    ctxOv.restore();
+  }
+  // bx,by,bw,bh = board box in canvas space; canvas bounds keep badges on screen
+  function drawGuidance(bx,by,bw,bh){
+    const step=bw/4, r=Math.max(9, Math.min(26, step*0.28));
+    const pulse=0.5+0.5*Math.sin(performance.now()/180);
+    if (config.diagnostics && lastRead){
+      for (let i=0;i<16;i++){
+        const t=lastRead.tiles[i], rr=Math.floor(i/4), cc=i%4;
+        const cx=bx+(cc+0.5)*step, cy=by+(rr+0.5)*(bh/4), s=Math.max(10, step*0.3);
+        ctxOv.save();
+        ctxOv.fillStyle = t.value===null ? 'rgba(0,0,0,0.75)' : `rgb(${t.avg.join(',')})`;
+        ctxOv.fillRect(cx-s/2, cy-s/2, s, s);
+        ctxOv.strokeStyle='#fff'; ctxOv.lineWidth=1.5; ctxOv.strokeRect(cx-s/2, cy-s/2, s, s);
+        ctxOv.fillStyle='#fff'; ctxOv.font=`800 ${Math.round(s*0.45)}px system-ui, sans-serif`;
+        ctxOv.textAlign='center'; ctxOv.textBaseline='middle';
+        ctxOv.fillText(t.value===null?'?':(t.value===1?'+1':String(t.value)), cx, cy+1);
+        ctxOv.restore();
+      }
+    }
+    if (!detectionActive){ guideHeader.style.display='none'; return; }
+    guideHeader.style.display='block';
+    if (!plan){ guideHeader.textContent='Reading board…'; return; }
+    guideHeader.textContent = plan.bestTaps ? `${plan.bestTaps} taps → score ${plan.bestSum}` : `Solved, score ${plan.bestSum}. Train for a new board`;
+    // Badges sit on the game's white dots. Measured as a fraction of the tile pitch so it
+    // holds at any capture size: dot centres are ~0.57 pitch left of the grid, ~0.64 above it.
+    for (let i=0;i<4;i++){
+      const n=plan.bestRowTaps[i]; if (!n) continue;
+      drawBadge(clamp(bx-step*0.57, r+2, overlay.width-r-2), by+(i+0.5)*(bh/4), r, n, pulse);
+    }
+    for (let j=0;j<4;j++){
+      const n=plan.bestColTaps[j]; if (!n) continue;
+      drawBadge(bx+(j+0.5)*step, clamp(by-step*0.64, r+2, overlay.height-r-2), r, n, pulse);
+    }
+  }
+
+  function drawOverlay(){
+    updateOverlayBox();
+    const vw=overlay.width, vh=overlay.height;
+    ctxOv.clearRect(0,0,vw,vh);
+    const vW=video.videoWidth||1, vH=video.videoHeight||1;
+    if (isCropMode()){
+      const cr=cropRect(), s=vw/cr.w;
+      try { ctxOv.drawImage(video, cr.x, cr.y, cr.w, cr.h, 0, 0, vw, vh); } catch(_){}
+      const bx=(boardRect.x-cr.x)*s, by=(boardRect.y-cr.y)*s, bw=boardRect.w*s, bh=boardRect.h*s;
+      drawGridAtRect(bx,by,bw,bh);
+      drawGuidance(bx,by,bw,bh);
+      return;
+    }
+    const sx=vw/vW, sy=vh/vH;
+    if ((editor.mode==='edit'||editor.mode==='draw') && editor.rect){
+      drawGridAtRect(editor.rect.x, editor.rect.y, editor.rect.w, editor.rect.h);
+      if (editor.mode==='edit') for (const hd of getHandleRects(editor.rect, editor.handleSize)){
+        ctxOv.fillStyle='rgba(88,176,255,0.95)'; ctxOv.fillRect(hd.x,hd.y,hd.w,hd.h);
+      }
+    } else if (boardRect){
+      drawGridAtRect(boardRect.x*sx, boardRect.y*sy, boardRect.w*sx, boardRect.h*sy);
+      drawGuidance(boardRect.x*sx, boardRect.y*sy, boardRect.w*sx, boardRect.h*sy);
+    }
+  }
+
+  // ---- editor geometry (same behaviour as Zen)
+  function squareFromRectCentered(r,maxW,maxH){
+    const cx=r.x+r.w/2, cy=r.y+r.h/2, side=Math.min(Math.max(r.w,r.h,20), Math.min(maxW,maxH));
+    return { x:clamp(cx-side/2,0,maxW-side), y:clamp(cy-side/2,0,maxH-side), w:side, h:side };
+  }
+  function getHandleRects(r,hs){
+    return [
+      {name:'nw', x:r.x-hs/2, y:r.y-hs/2, w:hs, h:hs},
+      {name:'ne', x:r.x+r.w-hs/2, y:r.y-hs/2, w:hs, h:hs},
+      {name:'se', x:r.x+r.w-hs/2, y:r.y+r.h-hs/2, w:hs, h:hs},
+      {name:'sw', x:r.x-hs/2, y:r.y+r.h-hs/2, w:hs, h:hs},
+    ];
+  }
+  function hitTestHandle(x,y,r,hs){ for (const h of getHandleRects(r,hs)){ if (x>=h.x&&x<=h.x+h.w&&y>=h.y&&y<=h.y+h.h) return h.name; } return null; }
+  function pointInRect(x,y,r){ return x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h; }
+  function clampRect(x0,y0,dx,dy,maxW,maxH){
+    const x1=clamp(x0+dx,0,maxW), y1=clamp(y0+dy,0,maxH);
+    const x=clamp(Math.min(x0,x1),0,maxW), y=clamp(Math.min(y0,y1),0,maxH);
+    return { x, y, w:clamp(Math.abs(x1-x0),0,maxW-x), h:clamp(Math.abs(y1-y0),0,maxH-y) };
+  }
+  function squareResizeFromCorner(st, handle, dx, dy, maxW, maxH){
+    const minSide=20; let side=st.w, x=st.x, y=st.y;
+    if (handle==='se'){ side=clamp(side+Math.max(dx,dy), minSide, Math.min(maxW-st.x, maxH-st.y)); }
+    else if (handle==='ne'){ side=clamp(side+Math.max(dx,-dy), minSide, Math.min(maxW-st.x, st.y+st.h)); y=clamp(st.y+st.h-side,0,maxH-side); }
+    else if (handle==='nw'){ side=clamp(side+Math.max(-dx,-dy), minSide, Math.min(st.x+st.w, st.y+st.h)); x=clamp(st.x+st.w-side,0,maxW-side); y=clamp(st.y+st.h-side,0,maxH-side); }
+    else if (handle==='sw'){ side=clamp(side+Math.max(-dx,dy), minSide, Math.min(st.x+st.w, maxH-st.y)); x=clamp(st.x+st.w-side,0,maxW-side); }
+    return { x, y, w:side, h:side };
+  }
+  function getOverlayXY(e){
+    const cr=overlay.getBoundingClientRect();
+    const p = (e.clientX!=null) ? e : (e.touches&&e.touches[0]) || (e.changedTouches&&e.changedTouches[0]) || {clientX:cr.left, clientY:cr.top};
+    return { x:p.clientX-cr.left, y:p.clientY-cr.top };
+  }
+
+  function commitEditorRectToBoard(){
+    if (!editor.rect || !(video.videoWidth && video.videoHeight)){
+      alert('Video not ready yet. Start capture and wait a moment, then try again.');
+      return false;
+    }
+    const sx=video.videoWidth/overlay.width, sy=video.videoHeight/overlay.height, r=editor.rect;
+    boardRect={ x:r.x*sx, y:r.y*sy, w:r.w*sx, h:r.h*sy };
+    hasBoard=true;
+    board=null; boardKey=null; plan=null; invalidateRead(); renderResults();
+    btnClearBoard.disabled=false; btnStart.disabled=detectionActive; btnStop.disabled=!detectionActive;
+    return true;
+  }
+  function finishEdit(){
+    if (editor.mode!=='edit' || !editor.rect) return;
+    if (!commitEditorRectToBoard()) return;
+    editor.mode='idle'; setOverlayPointer(false);
+    btnDoneEdit.disabled=true; quickResizeGroup.style.display='none';
+    drawOverlay();
+  }
+
+  // ---- pointer + keyboard
+  function onPointerDown(e){
+    e.preventDefault(); updateOverlayBox();
+    pointerState.active=true; pointerState.id=e.pointerId ?? -1;
+    try { overlay.setPointerCapture(e.pointerId); } catch(_){}
+    overlay.focus();
+    const {x,y}=getOverlayXY(e); editor.start={x,y};
+    if (editor.mode==='edit'){
+      const h = editor.rect ? hitTestHandle(x,y,editor.rect,editor.handleSize) : null;
+      if (h){ editor.activeHandle=h; editor.rectStart={...editor.rect}; }
+      else if (editor.rect && pointInRect(x,y,editor.rect)){ editor.activeHandle='move'; editor.rectStart={...editor.rect}; }
+      else { editor.mode='draw'; editor.rect={x,y,w:0,h:0}; }
+    }
+    drawOverlay();
+  }
+  function onPointerMove(e){
+    if (!pointerState.active) return;
+    const {x,y}=getOverlayXY(e), dx=x-editor.start.x, dy=y-editor.start.y;
+    if (editor.mode==='draw' && editor.rect){ editor.rect=clampRect(editor.start.x, editor.start.y, dx, dy, overlay.width, overlay.height); drawOverlay(); return; }
+    if (editor.mode==='edit' && editor.rect && editor.activeHandle){
+      const st=editor.rectStart;
+      editor.rect = editor.activeHandle==='move'
+        ? { x:clamp(st.x+dx,0,overlay.width-st.w), y:clamp(st.y+dy,0,overlay.height-st.h), w:st.w, h:st.h }
+        : squareResizeFromCorner(st, editor.activeHandle, dx, dy, overlay.width, overlay.height);
+      drawOverlay();
+    }
+  }
+  function onPointerUp(e){
+    pointerState.active=false;
+    try { overlay.releasePointerCapture(e.pointerId); } catch(_){}
+    if (editor.mode==='draw' && editor.rect){
+      editor.rect=squareFromRectCentered(editor.rect, overlay.width, overlay.height);
+      editor.mode='edit'; btnDoneEdit.disabled=false; drawOverlay();
+    } else if (editor.mode==='edit') editor.activeHandle=null;
+  }
+  overlay.addEventListener('pointerdown', onPointerDown, { passive:false });
+  overlay.addEventListener('pointermove', onPointerMove, { passive:false });
+  overlay.addEventListener('pointerup', onPointerUp);
+  overlay.addEventListener('pointercancel', onPointerUp);
+
+  function nudge(dx, dy, grow){
+    const r=editor.rect;
+    if (grow){
+      const side=clamp(r.w+grow, 20, Math.min(overlay.width, overlay.height));
+      r.x=clamp(r.x-(side-r.w)/2, 0, overlay.width-side); r.y=clamp(r.y-(side-r.h)/2, 0, overlay.height-side);
+      r.w=side; r.h=side;
+    }
+    r.x=clamp(r.x+dx, 0, overlay.width-r.w); r.y=clamp(r.y+dy, 0, overlay.height-r.h);
+  }
+  function onKeyDown(e){
+    if (editor.mode!=='edit' || !editor.rect) return;
+    const tag=(document.activeElement?.tagName||'').toLowerCase();
+    if (tag==='input'||tag==='select'||tag==='textarea') document.activeElement.blur();
+    const step=e.shiftKey?5:1; let used=true;
+    switch(e.key){
+      case 'ArrowLeft': nudge(-step,0,0); break;
+      case 'ArrowRight': nudge(step,0,0); break;
+      case 'ArrowUp': nudge(0,-step,0); break;
+      case 'ArrowDown': nudge(0,step,0); break;
+      case '+': case '=': nudge(0,0,step); break;
+      case '-': nudge(0,0,-step); break;
+      case 'Enter': finishEdit(); break;
+      default: used=false;
+    }
+    if (used){ e.preventDefault(); drawOverlay(); }
+  }
+  window.addEventListener('keydown', onKeyDown);
+
+  // ---- loops
+  let rafUi=0, rafVid=0;
+  function uiLoop(){ if (!running) return; drawOverlay(); rafUi=requestAnimationFrame(uiLoop); }
+  let lastFPSTs=0, framesInBucket=0;
+  function tick(now){
+    if (now-lastFPSTs>=1000){ elFPS.textContent=String(framesInBucket); framesInBucket=0; lastFPSTs=now; }
+    framesInBucket++;
+    processFrame(now);
+  }
+  function videoLoopVFC(now){ if (!running) return; tick(now); video.requestVideoFrameCallback(videoLoopVFC); }
+  function videoLoopRaf(){ if (!running) return; tick(performance.now()); rafVid=requestAnimationFrame(videoLoopRaf); }
+  function startLoops(){
+    lastFPSTs=performance.now(); framesInBucket=0;
+    rafUi=requestAnimationFrame(uiLoop);
+    if (typeof video.requestVideoFrameCallback==='function') video.requestVideoFrameCallback(videoLoopVFC);
+    else rafVid=requestAnimationFrame(videoLoopRaf);
+  }
+
+  // ---- capture
+  async function startCapture(){
+    try {
+      const s = await navigator.mediaDevices.getDisplayMedia({ video:{ displaySurface:'window', frameRate:{ideal:30,max:60}, cursor:'never' }, audio:false });
+      video.srcObject=s; stream=s;
+      const track=s.getVideoTracks()[0];
+      track.addEventListener('ended', stopCapture);
+      try { if ('contentHint' in track) track.contentHint='detail'; } catch(_){}
+      btnCapture.disabled=true; btnStopCapture.disabled=false; btnSetBoard.disabled=false;
+      running=true; startLoops();
+    } catch(e){
+      console.error(e);
+      alert('Screen/window capture was not granted.');
+    }
+  }
+  function stopCapture(){
+    if (stream) stream.getTracks().forEach(t=>t.stop());
+    stream=null; video.srcObject=null; running=false;
+    cancelAnimationFrame(rafUi); cancelAnimationFrame(rafVid);
+    btnCapture.disabled=false; btnStopCapture.disabled=true; btnSetBoard.disabled=true;
+    clearBoard();
+    drawOverlay();
+  }
+  function clearBoard(){
+    detectionActive=false; hasBoard=false; boardRect=null; lastRead=null;
+    board=null; boardKey=null; plan=null; invalidateRead();
+    Object.assign(editor, { mode:'idle', rect:null, activeHandle:null });
+    setOverlayPointer(false);
+    btnDoneEdit.disabled=true; btnClearBoard.disabled=true; quickResizeGroup.style.display='none';
+    btnStart.disabled=true; btnStop.disabled=true;
+    guideHeader.style.display='none';
+    elRead.textContent='-';
+    renderResults();
+  }
+
+  // ---- controls
+  btnCapture.addEventListener('click', startCapture);
+  btnStopCapture.addEventListener('click', stopCapture);
+  btnSetBoard.addEventListener('click', ()=>{
+    if (!video.srcObject){ alert('Start capture first.'); return; }
+    editor.mode='edit';
+    updateOverlayBox();
+    setOverlayPointer(true);
+    if (hasBoard && boardRect && video.videoWidth){
+      const sx=overlay.width/video.videoWidth, sy=overlay.height/video.videoHeight;
+      editor.rect={ x:boardRect.x*sx, y:boardRect.y*sy, w:boardRect.w*sx, h:boardRect.h*sy };
+    } else {
+      const side=Math.round(Math.min(overlay.width, overlay.height)*0.5);
+      editor.rect={ x:Math.round((overlay.width-side)/2), y:Math.round((overlay.height-side)/2), w:side, h:side };
+    }
+    btnDoneEdit.disabled=false; quickResizeGroup.style.display='flex';
+    try { if (document.activeElement && document.activeElement!==overlay) document.activeElement.blur(); } catch(_){}
+    overlay.focus();
+    drawOverlay();
+  });
+  btnDoneEdit.addEventListener('click', finishEdit);
+  btnClearBoard.addEventListener('click', ()=>{ clearBoard(); drawOverlay(); });
+  btnShrinkBoard.addEventListener('click', ()=>{ if (editor.rect){ nudge(0,0,-10); drawOverlay(); } });
+  btnGrowBoard.addEventListener('click', ()=>{ if (editor.rect){ nudge(0,0,10); drawOverlay(); } });
+  btnStart.addEventListener('click', ()=>{
+    if (!stream){ alert('Start capture first.'); return; }
+    if (!hasBoard){ alert('Set the board first.'); return; }
+    detectionActive=true; board=null; boardKey=null; plan=null; invalidateRead();
+    btnStart.disabled=true; btnStop.disabled=false; renderResults();
+  });
+  btnStop.addEventListener('click', ()=>{
+    detectionActive=false; btnStart.disabled=!hasBoard; btnStop.disabled=true;
+    guideHeader.style.display='none';
+  });
+
+  // ---- sizing hooks
+  const onResize=()=>{ updateOverlayBox(); if (editor.mode!=='idle') drawOverlay(); };
+  window.addEventListener('resize', onResize);
+  video.addEventListener('loadedmetadata', onResize);
+  let ro=null; try { ro=new ResizeObserver(onResize); ro.observe(previewWrap); } catch(_){}
+
+  syncAdvancedUI();
+  clearBoard();
+
+  return {
+    destroy(){
+      if (stream) stream.getTracks().forEach(t=>t.stop());
+      stream=null; running=false;
+      cancelAnimationFrame(rafUi); cancelAnimationFrame(rafVid);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('resize', onResize);
+      try { ro && ro.disconnect(); } catch(_){}
+    }
+  };
+}
+
+// === school-rec/view ===
+
+let schoolRecEngine = null;
+async function schoolRecInit(root){
+  root.innerHTML = `
+    <section class="card">
+      <div class="title">School Screen Record</div>
+      <div class="instructions">
+        <h3>How to Use</h3>
+        <ul>
+          <li>Mirror or cast your device to your computer (native apps, Discord, etc.), then capture that window here. Nothing leaves your browser.</li>
+          <li><strong>Flow:</strong> Start Capture → Set Board → Done → Start Detection.</li>
+          <li><strong>Set Board:</strong> drag a square around the 4×4 tiles only, edge to edge. Leave the white dots outside the box.</li>
+          <li><strong>To adjust board:</strong> Arrow keys to move, + / = to grow, - to shrink, Enter = Done.</li>
+          <li>Badges appear on the white dots: <strong>×1</strong> = tap that dot once, <strong>×2</strong> = tap it twice. The plan updates live as you tap, so you can follow it in any order.</li>
+          <li>When several plans reach the top score, the one with the fewest taps is shown.</li>
+          <li>If tiles show as unclear, open Advanced, turn on diagnostics, and raise the Tolerance a little. If your stream changes colours a lot (HDR, heavy compression), try Hue mode.</li>
+          <li>If you are having trouble, try a different browser (Chrome/Edge/Brave recommended).</li>
+          <li>This is fan made. Don't bug souptheduck about this helper lol.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="layout-zen layout-srec">
+      <section class="card">
+        <div class="panel-title" style="margin-bottom:8px;">Controls</div>
+        <div class="controls-zen">
+          <div class="row-zen">
+            <button id="srBtnCapture" class="btn btn-primary"><span class="step-num">1</span>Start Capture</button>
+            <button id="srBtnStopCapture" class="btn btn-ghost" disabled>Stop Capture</button>
+          </div>
+
+          <div class="row-zen">
+            <button id="srBtnSetBoard" class="btn btn-primary" disabled><span class="step-num">2</span>Set Board</button>
+            <button id="srBtnDoneEdit" class="btn btn-primary" disabled><span class="step-num">3</span>Done</button>
+            <button id="srBtnClearBoard" class="btn btn-ghost" disabled>Clear</button>
+            <div id="srQuickResizeGroup" style="display:none; flex-direction:column; gap:8px; width:100%;">
+              <ul style="margin:0; padding-left:18px; color:#9eb6c8; font-size:12px; line-height:1.7;">
+                <li>Use arrow keys to move board</li>
+                <li>Use +/= to increase board size by 1px</li>
+                <li>Use - to decrease board size by 1px</li>
+                <li>Use the buttons below to alter size by 10px</li>
+              </ul>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <span style="color:#9eb6c8; font-size:12px; font-weight:600;">Quick resize:</span>
+                <button id="srBtnShrinkBoard" class="btn btn-ghost">−</button>
+                <button id="srBtnGrowBoard" class="btn btn-ghost">+</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="row-zen">
+            <button id="srBtnStart" class="btn btn-primary" disabled><span class="step-num">4</span>Start Detection</button>
+            <button id="srBtnStop" class="btn btn-ghost" disabled>Stop Detection</button>
+          </div>
+
+          <details class="details-zen">
+            <summary>Advanced</summary>
+            <div class="row-zen" style="margin-top:8px; width:100%">
+              <div style="flex:1; min-width:180px">
+                <label>Match Mode</label>
+                <select id="srSelMatchMode" class="select-zen">
+                  <option value="rgb" selected>RGB distance (default)</option>
+                  <option value="hue">Hue distance (HDR/Meet/Discord)</option>
+                </select>
+              </div>
+              <div style="flex:1; min-width:140px">
+                <label>Tolerance</label>
+                <input id="srInpTol" class="input" type="number" min="1" max="255" step="1" />
+              </div>
+            </div>
+            <div class="row-zen" style="margin-top:8px; width:100%">
+              <div style="flex:1; min-width:140px">
+                <label>Min Vote Share (0..1)</label>
+                <input id="srInpVote" class="input" type="number" min="0.05" max="1" step="0.05" />
+              </div>
+              <div style="flex:1; min-width:140px">
+                <label>Stable Reads</label>
+                <input id="srInpStable" class="input" type="number" min="1" max="30" step="1" />
+              </div>
+            </div>
+            <div class="row-zen" style="margin-top:8px; width:100%; align-items:center;">
+              <label style="display:flex; align-items:center; gap:8px;">
+                <input id="srChkDiagnostics" type="checkbox" />
+                Show diagnostics overlay (what each tile was read as)
+              </label>
+            </div>
+            <div class="row-zen" style="margin-top:8px">
+              <button id="srBtnRestoreDefaults" class="btn btn-ghost">Restore Advanced Defaults</button>
+            </div>
+          </details>
+
+          <div class="status-zen">
+            <div class="cell">FPS: <strong id="srFps">0</strong></div>
+            <div class="cell">Read: <strong id="srRead">-</strong></div>
+            <div class="cell">Score: <strong id="srScore">-</strong></div>
+          </div>
+        </div>
+      </section>
+
+      <div style="display:grid; gap:16px; min-width:0;">
+        <section class="card">
+          <div class="panel-title" style="margin-bottom:8px;">Preview</div>
+          <div class="preview-zen" id="srPreviewWrap">
+            <div id="srGuideHeader" class="guideHeader" style="display:none"></div>
+            <video id="srVideo" autoplay playsinline muted></video>
+            <canvas id="srOverlay" class="overlay pe-none"></canvas>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="panel-title" style="margin-bottom:8px;">Optimal Solution</div>
+          <div id="srResultsShell"></div>
+        </section>
+      </div>
+    </section>
+  `;
+  schoolRecEngine = initSchoolRecEngine();
+}
+
+function schoolRecDestroy(){
+  try { schoolRecEngine && schoolRecEngine.destroy(); } catch(e){ console.warn(e); }
+  schoolRecEngine = null;
+}
+
+// === school/view (sub-options: Main Tool / Screen Record Tool) ===
+
+const SCHOOL_SUB_KEY = 'school_sub_view';
+const schoolSubs = {
+  main: { init: gridInit,      destroy: gridDestroy },
+  rec:  { init: schoolRecInit, destroy: schoolRecDestroy },
+};
+let schoolSubCurrent = null;
+
+async function schoolShowSub(name){
+  if (!schoolSubs[name]) name = 'main';
+  if (schoolSubCurrent){
+    try { schoolSubs[schoolSubCurrent].destroy(); } catch(e){ console.warn('School sub destroy error:', e); }
+  }
+  schoolSubCurrent = name;
+  try { localStorage.setItem(SCHOOL_SUB_KEY, name); } catch {}
+  document.querySelectorAll('#schoolSubToggle .seg-btn').forEach(b => {
+    const on = b.dataset.sub === name;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+  const host = document.getElementById('schoolSubRoot');
+  host.innerHTML = '';
+  await schoolSubs[name].init(host);
+}
+
+async function schoolInit(root){
+  root.innerHTML = `
+    <div style="display:flex; justify-content:center; margin-bottom:16px;">
+      <nav class="segmented" id="schoolSubToggle" aria-label="School tool mode">
+        <button class="seg-btn" data-sub="main" aria-pressed="false">Main Tool</button>
+        <button class="seg-btn" data-sub="rec" aria-pressed="false">Screen Record Tool</button>
+      </nav>
+    </div>
+    <div id="schoolSubRoot"></div>
+  `;
+  document.getElementById('schoolSubToggle').addEventListener('click', (e) => {
+    const btn = e.target.closest('.seg-btn');
+    if (!btn || btn.dataset.sub === schoolSubCurrent) return;
+    e.preventDefault();
+    schoolShowSub(btn.dataset.sub);
+  });
+  let saved = null;
+  try { saved = localStorage.getItem(SCHOOL_SUB_KEY); } catch {}
+  await schoolShowSub(saved || 'main');
+}
+
+function schoolDestroy(){
+  if (schoolSubCurrent){
+    try { schoolSubs[schoolSubCurrent].destroy(); } catch(e){ console.warn('School sub destroy error:', e); }
+  }
+  schoolSubCurrent = null;
+}
+
 // === main ===
 
 
@@ -2961,7 +3738,7 @@ const toggle = document.getElementById('segmentedToggle');
 const footerLinks = document.querySelectorAll('.footer [data-jump]');
 
 const views = {
-  grid:    { init: gridInit,    destroy: gridDestroy },
+  grid:    { init: schoolInit,  destroy: schoolDestroy },
   sanctum: { init: sanctumInit, destroy: sanctumDestroy },
   diamond: { init: diamondInit, destroy: diamondDestroy },
   zen:     { init: zenInit,     destroy: zenDestroy },
